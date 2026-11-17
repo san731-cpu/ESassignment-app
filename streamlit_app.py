@@ -1,7 +1,19 @@
+import hashlib
+
 import streamlit as st
 from pypdf.errors import FileNotDecryptedError, PdfReadError
 
-from review_core import QUESTIONS, build_report, extract_pdf_pages, find_evidence
+from review_core import (
+    MAX_ANALYSIS_CHARS,
+    QUESTIONS,
+    CaseSummary,
+    LocalAnalysisError,
+    LocalModelUnavailable,
+    analyze_selected_questions,
+    build_report,
+    check_local_model,
+    extract_pdf_pages,
+)
 
 
 st.set_page_config(
@@ -51,25 +63,55 @@ st.markdown(
     <div class="hero">
       <div class="eyebrow">A thoughtful second look</div>
       <h1>Clinical Case Review</h1>
-      <p>Bring focused supervision questions to a case. Find relevant passages in a PDF, then collect the evidence you want to take into consultation.</p>
+      <p>Bring focused supervision questions to a case. Analyze the full record with a local model, review its cited evidence, and collect findings for consultation.</p>
     </div>
-    <div class="privacy-note"><strong>Protect client privacy.</strong> De-identify the record before uploading. The PDF is processed in this app session and is not sent to an AI service or saved by this app. Verify every excerpt against the original record; this tool does not provide clinical assessment or advice.</div>
+    <div class="privacy-note"><strong>Protect client privacy.</strong> De-identify records before uploading. PDF text is sent only to Ollama at 127.0.0.1 on the machine running this app; no cloud model API is used. If this app runs on a remote host, its local Ollama processes the PDF there. Verify all generated findings and citations; this tool is not an authoritative clinical assessment.</div>
     """,
     unsafe_allow_html=True,
 )
+
+with st.sidebar:
+    st.subheader("Local model setup")
+    st.write("Install Ollama on the same machine as this app and download the default model:")
+    st.code("ollama pull qwen2.5:7b")
+    st.caption("Keep Ollama running at 127.0.0.1:11434. Set OLLAMA_MODEL to use another model already installed there.")
+    try:
+        local_model_name = check_local_model()
+        st.success(f"Local model ready: {local_model_name}")
+    except LocalModelUnavailable as exc:
+        local_model_name = None
+        st.warning(str(exc))
 
 uploaded_pdf = st.file_uploader("Upload a de-identified PDF", type=["pdf"], accept_multiple_files=False, max_upload_size=50)
 
 pages: list[tuple[int, str]] = []
 if uploaded_pdf is None:
-    st.info("Upload a PDF to search its text locally and open the ten review prompts.")
+    st.session_state["document_hash"] = None
+    st.session_state["selected_question_ids"] = set()
+    st.session_state["case_summary"] = None
+    st.info("Upload a PDF to analyze the full document and open the ten review prompts.")
 else:
     pdf_bytes = uploaded_pdf.getvalue()
+    document_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    if st.session_state.get("document_hash") != document_hash:
+        st.session_state["document_hash"] = document_hash
+        st.session_state["selected_question_ids"] = set()
+        st.session_state["case_summary"] = None
     try:
         pages = extract_pdf_pages(pdf_bytes)
-        st.success(f"PDF ready · {len(pages)} pages · processed locally")
         if not any(text.strip() for _, text in pages):
             st.warning("No selectable text was found. This may be a scanned PDF; OCR is not available in this app.")
+        else:
+            if local_model_name:
+                st.success(f"PDF ready · {len(pages)} pages · local model `{local_model_name}` is ready")
+            else:
+                st.warning(f"PDF ready · {len(pages)} pages. See the local model setup in the sidebar.")
+            total_chars = sum(len(text) for _, text in pages)
+            if total_chars > MAX_ANALYSIS_CHARS:
+                st.warning(
+                    f"This PDF has {total_chars:,} text characters, above the "
+                    f"{MAX_ANALYSIS_CHARS:,}-character single-pass model limit. Split it before analysis."
+                )
     except ValueError:
         st.error("This file does not appear to be a valid PDF. Choose a PDF and try again.")
     except (PdfReadError, FileNotDecryptedError) as exc:
@@ -77,45 +119,78 @@ else:
 
 if pages and any(text.strip() for _, text in pages):
     selected_ids = st.session_state.setdefault("selected_question_ids", set())
-    st.markdown('<div class="section-label">Choose a review question</div>', unsafe_allow_html=True)
-    st.caption("Each button finds a few matching excerpts; it does not interpret them or fill in information that is absent.")
+    st.markdown('<div class="section-label">Choose review questions</div>', unsafe_allow_html=True)
+    st.caption("Select one or more prompts. The full PDF is analyzed once to generate the selected answers and a combined executive summary.")
     columns = st.columns(2, gap="medium")
     for index, question in enumerate(QUESTIONS):
         with columns[index % 2]:
             label = f"{index + 1:02d}  ·  {question.title}"
-            if st.button(label, key=f"question-{question.id}", use_container_width=True):
-                selected_ids.add(question.id)
+            is_selected = question.id in selected_ids
+            if st.button(
+                label,
+                key=f"question-{question.id}",
+                type="primary" if is_selected else "secondary",
+                use_container_width=True,
+            ):
+                if is_selected:
+                    selected_ids.remove(question.id)
+                else:
+                    selected_ids.add(question.id)
+                st.session_state["case_summary"] = None
+                st.rerun()
 
-    selected_questions = [
-        (question, find_evidence(question, pages))
-        for question in QUESTIONS
-        if question.id in selected_ids
-    ]
+    selected_questions = [question for question in QUESTIONS if question.id in selected_ids]
     if selected_questions:
+        st.caption(f"{len(selected_questions)} question(s) selected")
+    if st.button(
+        "Generate Clinical Case Summary",
+        type="primary",
+        use_container_width=True,
+        disabled=not selected_questions,
+    ):
+        try:
+            with st.spinner("Analyzing the full PDF and generating the selected findings..."):
+                st.session_state["case_summary"] = analyze_selected_questions(selected_questions, pages)
+        except (LocalModelUnavailable, LocalAnalysisError) as exc:
+            st.error(str(exc))
+
+    case_summary: CaseSummary | None = st.session_state.get("case_summary")
+    if case_summary:
         st.divider()
-        st.subheader("Requested findings")
-        for question, evidence_items in selected_questions:
+        st.subheader("Clinical Case Summary")
+        st.markdown("### Executive summary")
+        st.markdown(case_summary.executive_summary.answer)
+        if case_summary.executive_summary.citations:
+            for citation in case_summary.executive_summary.citations:
+                st.markdown(f'- **Critical detail · PDF page {citation.page}** · "{citation.quote}"')
+        else:
+            st.info("The local model identified insufficient documented information for the executive summary.")
+
+        st.markdown("### Question-specific findings")
+        for question, result in case_summary.analyses:
             with st.container(border=True):
                 st.markdown(f"#### {question.title}")
                 st.markdown(f"_{question.prompt}_")
-                if evidence_items:
-                    st.caption(f"Local keyword matches · {len(evidence_items)} excerpt(s)")
-                    for evidence in evidence_items:
-                        st.markdown(f"**PDF page {evidence.page}**")
-                        st.write(f"“{evidence.text}”")
+                st.markdown(result.answer)
+                if result.citations:
+                    st.markdown("**Verified, question-specific citations**")
+                    for citation in result.citations:
+                        st.markdown(f'- **PDF page {citation.page}** · "{citation.quote}"')
                 else:
-                    st.info("No matching text was found by local keyword search. Review this question manually in the source PDF.")
-        export = build_report(selected_questions)
+                    st.info("The local model identified insufficient relevant documentation for this question.")
+        export = build_report(case_summary)
         st.download_button(
-            "Download requested findings",
+            "Download Clinical Case Summary",
             data=export.encode("utf-8"),
-            file_name="clinical-case-review.md",
+            file_name="clinical-case-summary.md",
             mime="text/markdown",
             use_container_width=True,
         )
-        if st.button("Clear selected questions", type="secondary"):
-            st.session_state["selected_question_ids"] = set()
-            st.rerun()
+
+    if selected_ids and st.button("Clear selected questions", type="secondary"):
+        st.session_state["selected_question_ids"] = set()
+        st.session_state["case_summary"] = None
+        st.rerun()
 
 st.divider()
-st.caption("Local evidence search only · No AI analysis is configured · Always use professional judgment and supervision")
+st.caption("Whole-document analysis by a local model · Verify every citation · Always use professional judgment and supervision")
