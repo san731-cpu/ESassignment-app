@@ -1,25 +1,22 @@
-# 🎈 Blank app template
+# Clinical Case Review
 
-A simple Streamlit app template for you to modify!
+An in-session PDF evidence finder for ten clinical supervision prompts. Upload a de-identified PDF, choose questions, review the matching source excerpts, and download the selected findings as Markdown.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Privacy and limitations
 
-### How to run it on your own machine
+- PDF text extraction and keyword matching run locally in the Streamlit app process. This app does not send records to an AI service or write their contents to disk.
+- Uploaded files remain in memory for the active Streamlit session. Closing the session clears the app's in-memory upload and selected questions; hosting infrastructure may have its own session and operational policies.
+- The app has no AI/model integration. It surfaces lexical matches from the source PDF, not synthesized answers, clinical recommendations, or a safety assessment. Scanned PDFs need OCR, which is not included.
+- De-identify records before upload and verify every excerpt against the original. This tool is not a substitute for clinical judgment, supervision, or professional obligations.
 
-Prerequisite: install `uv` if you don't already have it.
+## Run locally
+
+Prerequisite: install `uv`.
 
 ```
 $ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-1. Sync the dependencies
-
-   ```
-   $ uv sync
-   ```
-
-2. Run the app
-
-   ```
-   $ uv run streamlit run streamlit_app.py
-   ```
+1. Sync dependencies: `uv sync`
+2. Start the app: `uv run streamlit run streamlit_app.py`
+3. Run focused tests: `uv run python -m unittest discover -s tests`

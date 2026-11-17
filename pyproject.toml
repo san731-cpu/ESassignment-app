@@ -1,10 +1,11 @@
 [project]
-name = "blank-app-template"
+name = "clinical-case-review"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "Local PDF evidence finder for clinical case review."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "pypdf>=5.0.0",
     "streamlit>=1.60.0",
 ]
 
